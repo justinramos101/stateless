@@ -1,15 +1,85 @@
 <p align="center"><img width="650" src="./assets/stateless.svg" alt="Stateless logo. Fire gopher designed by https://www.deviantart.com/quasilyte"></p>
 
 <p align="center">
-    <a href="https://pkg.go.dev/github.com/qmuntal/stateless?tab=doc"><img src="https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white" alt="go.dev"></a>
-    <a href="https://github.com/qmuntal/stateless/actions/workflows/test.yml"><img src="https://github.com/qmuntal/stateless/actions/workflows/test.yml/badge.svg" alt="Build Status"></a>
-    <a href="https://coveralls.io/github/qmuntal/stateless"><img src="https://coveralls.io/repos/github/qmuntal/stateless/badge.svg" alt="Code Coverage"></a>
-    <a href="https://goreportcard.com/report/github.com/qmuntal/stateless"><img src="https://goreportcard.com/badge/github.com/qmuntal/stateless" alt="Go Report Card"></a>
+    <a href="https://pkg.go.dev/github.com/justinramos101/stateless?tab=doc"><img src="https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white" alt="go.dev"></a>
+    <a href="https://github.com/justinramos101/stateless/actions/workflows/test.yml"><img src="https://github.com/justinramos101/stateless/actions/workflows/test.yml/badge.svg" alt="Build Status"></a>
+    <a href="https://goreportcard.com/report/github.com/justinramos101/stateless"><img src="https://goreportcard.com/badge/github.com/justinramos101/stateless" alt="Go Report Card"></a>
     <a href="https://opensource.org/licenses/BSD-2-Clause"><img src="https://img.shields.io/badge/License-BSD%202--Clause-orange.svg" alt="Licenses"></a>
     <a href="https://github.com/avelino/awesome-go"><img src="https://awesome.re/mentioned-badge.svg" alt="Mentioned in Awesome Go"></a>
 </p>
 
 # Stateless
+
+This fork of [qmuntal/stateless](https://github.com/qmuntal/stateless) adds opt-in trigger execution timing. It retains the upstream BSD-2-Clause license and state-machine behavior.
+
+## Install this fork
+
+```sh
+go get github.com/justinramos101/stateless@feat/timing-observer
+```
+
+Import `github.com/justinramos101/stateless`. Inherited upstream tags still declare the upstream module path. Use this branch or a pseudo-version from a fork commit until the fork has its own release tag.
+
+## Observe trigger executions
+
+Register one observer before firing or sharing the machine. `SetExecutionObserver(nil)` disables observation. Registration replaces the previous observer and must not race with use.
+
+```go
+sm := stateless.NewStateMachine("idle")
+sm.Configure("idle").Permit("start", "running")
+sm.SetExecutionObserver(func(ctx context.Context, e stateless.Execution) {
+	log.Printf("execution=%d wait=%s run=%s outcome=%v",
+		e.ID, e.QueueWait, e.FinishedAt.Sub(e.StartedAt), e.Outcome)
+	if e.CompletedTransition != nil {
+		log.Printf("%v -> %v", e.CompletedTransition.Source,
+			e.CompletedTransition.Destination)
+	}
+})
+err := sm.FireCtx(context.Background(), "start")
+```
+
+The [runnable external-package example](observation_example_test.go) uses this API.
+
+### Measurement contract
+
+One `Execution` describes one attempted trigger execution. It includes ignored, internal, unhandled, failed, and interrupted executions. Queued items receive no ID or record until they execute. A queued `FireCtx` call can return before its item runs, or drain another caller's item and receive that item's error.
+
+`StartedAt` and `FinishedAt` bracket parameter validation, existing storage access, guards, selectors, actions, and transition hooks. Their monotonic difference includes instrumentation bookkeeping within that interval. It excludes the execution's own observer and mode bookkeeping. Immediate parent intervals include nested executions and their observers, so they are not exclusive durations. Activation, deactivation, queries, and individual action substages are outside this API.
+
+`QueueWait` starts immediately before append under the queue mutex and ends at `StartedAt`. It excludes contention before acquiring the enqueue mutex. It includes earlier executions and observers, queue-fetch contention, and delays while work remains pending after a failure. Immediate executions report zero queue wait.
+
+`ID` is a machine-local atomic sequence allocated when observed execution begins. It identifies an execution, not a submission or durable operation. IDs and callback arrival order need not match timestamp order under concurrency.
+
+`Source` is the first successful existing state read. `SelectedDestination` is the handler's destination before hierarchy descent. `KnownState.Known` distinguishes unknown state from a known nil value. `CompletedTransition` copies the exact final `OnTransitioned` argument after all existing completion hooks return. It can differ from the selected destination during hierarchy entry or inherited reentry. Its absence does not imply that storage was unchanged. State values are shallow copies; consumers must not mutate referenced values concurrently.
+
+`Kind` identifies the selected handler independently of `Outcome`. `KindSuppressed` means the existing fixed-transition path skipped a same-state destination. Dynamic same-state transitions still execute their existing actions. `KindUnresolved` means execution stopped before identifying a handler. A custom unhandled action can produce `KindUnhandled` with `ExecutionSucceeded`.
+
+`ExecutionFailed` retains the exact returned error in `Err`. There is no wrapping, rollback, retry, or queue flush. `ExecutionInterrupted` means the trigger body did not return normally, including panic or `runtime.Goexit`. Original trigger panics propagate unchanged. Panic values are not included in records.
+
+### Observer delivery
+
+The observer runs synchronously after `FinishedAt`, outside queue and storage locks. Queued execution keeps its slot until the observer returns, and `Firing()` remains true during delivery. A queued fire from the observer enqueues work that executes afterward. Never wait synchronously for queued work submitted from an observer or a callback.
+
+Immediate observers can overlap and can fire recursively. Protect a shared collector with a mutex and bound observer-triggered recursion. A panic escaping the observer, including one from its nested immediate fire, is suppressed without replacing an original trigger error or panic. Observers must return. Recovery cannot isolate `runtime.Goexit`, process exit, or permanent blocking in an observer. Process termination can prevent delivery entirely.
+
+The callback receives the executed item's original context, including cancellation. The library does not cancel execution or skip observation because that context is canceled. Callbacks retain their existing responsibility for honoring cancellation.
+
+### Interpreting a timeline
+
+Records with `CompletedTransition != nil` describe completed logical transitions. Their execution intervals and reported destinations support a transition timeline. For sequential queued executions, the next start minus the previous finish is an inter-execution gap. Differences between finish times measure intervals between completion observations.
+
+These measurements do not establish true state residence. Ordinary state writes precede entry, reentry writes follow entry, entry can fail after a write, and external storage can change independently. Immediate calls can overlap or leave storage different from an outer reported destination. Exact mutation histories require instrumentation at the storage owner. Observation adds no state reads or writes.
+
+### Benchmarking
+
+`BenchmarkQueuedReentryDisabled` and `BenchmarkQueuedReentryObserved` exercise queued reentry with guards, entry and exit actions, and transition hooks.
+
+```sh
+go test -run '^$' -bench '^BenchmarkQueuedReentry' -benchtime=200ms -count=3 -benchmem .
+```
+
+Disabled observation skips clocks, execution IDs, records, and observer delivery. Each queue element still carries one extra optional timestamp pointer, which can increase allocation bytes during queue growth. Enabled queued submissions allocate timestamp storage. Benchmark results depend on the workload and machine.
+
 
 **Create *state machines* and lightweight *state machine-based workflows* directly in Go code:**
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type fireMode interface {
@@ -23,13 +24,14 @@ func (f *fireModeImmediate) Firing() bool {
 func (f *fireModeImmediate) Fire(ctx context.Context, trigger Trigger, args ...any) error {
 	f.ops.Add(1)
 	defer f.ops.Add(^uint64(0))
-	return f.sm.internalFireOne(ctx, trigger, args...)
+	return f.sm.fireOne(ctx, trigger, FiringImmediate, nil, args...)
 }
 
 type queuedTrigger struct {
-	Context context.Context
-	Trigger Trigger
-	Args    []any
+	Context    context.Context
+	Trigger    Trigger
+	Args       []any
+	AdmittedAt *time.Time
 }
 
 type fireModeQueued struct {
@@ -63,7 +65,12 @@ func (f *fireModeQueued) enqueue(ctx context.Context, trigger Trigger, args ...a
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.triggers = append(f.triggers, queuedTrigger{Context: ctx, Trigger: trigger, Args: args})
+	var admittedAt *time.Time
+	if f.sm.executionObserver != nil {
+		now := time.Now()
+		admittedAt = &now
+	}
+	f.triggers = append(f.triggers, queuedTrigger{Context: ctx, Trigger: trigger, Args: args, AdmittedAt: admittedAt})
 }
 
 func (f *fireModeQueued) fetch() (et queuedTrigger, ok bool) {
@@ -84,5 +91,5 @@ func (f *fireModeQueued) fetch() (et queuedTrigger, ok bool) {
 
 func (f *fireModeQueued) execute(et queuedTrigger) error {
 	defer f.firing.Swap(false)
-	return f.sm.internalFireOne(et.Context, et.Trigger, et.Args...)
+	return f.sm.fireOne(et.Context, et.Trigger, FiringQueued, et.AdmittedAt, et.Args...)
 }

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/qmuntal/stateless"
+	"github.com/justinramos101/stateless"
 )
 
 const (
