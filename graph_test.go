@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/qmuntal/stateless"
+	"github.com/justinramos101/stateless"
 )
 
 var update = flag.Bool("update", false, "update golden files on failure")

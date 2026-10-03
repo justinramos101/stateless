@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"sync/atomic"
 )
 
 // State is used to to represent the possible machine states.
@@ -71,6 +72,8 @@ type StateMachine struct {
 	onTransitionedEvents   []TransitionFunc
 	stateMutex             sync.RWMutex
 	mode                   fireMode
+	executionObserver      func(context.Context, Execution)
+	executionID            atomic.Uint64
 }
 
 func newStateMachine(firingMode FiringMode) *StateMachine {
@@ -345,7 +348,7 @@ func (sm *StateMachine) internalFire(ctx context.Context, trigger Trigger, args 
 	return sm.mode.Fire(ctx, trigger, args...)
 }
 
-func (sm *StateMachine) internalFireOne(ctx context.Context, trigger Trigger, args ...any) error {
+func (sm *StateMachine) internalFireOne(ctx context.Context, execution *Execution, trigger Trigger, args ...any) error {
 	var (
 		config triggerWithParameters
 		ok     bool
@@ -357,32 +360,60 @@ func (sm *StateMachine) internalFireOne(ctx context.Context, trigger Trigger, ar
 	if err != nil {
 		return err
 	}
+	if execution != nil {
+		execution.Source = KnownState{Value: source, Known: true}
+	}
 	representativeState := sm.stateRepresentation(source)
 	var result triggerBehaviourResult
 	if result, ok = representativeState.FindHandler(ctx, trigger, args...); !ok {
+		if execution != nil {
+			execution.Kind = KindUnhandled
+		}
 		return sm.unhandledTriggerAction(ctx, representativeState.State, trigger, result.UnmetGuardConditions)
 	}
 	switch t := result.Handler.(type) {
 	case *ignoredTriggerBehaviour:
-		// ignored
+		if execution != nil {
+			execution.Kind = KindIgnored
+		}
 	case *reentryTriggerBehaviour:
+		if execution != nil {
+			execution.Kind = KindReentry
+			execution.SelectedDestination = KnownState{Value: t.Destination, Known: true}
+		}
 		transition := Transition{Source: source, Destination: t.Destination, Trigger: trigger}
-		err = sm.handleReentryTrigger(ctx, representativeState, transition, args...)
+		err = sm.handleReentryTrigger(ctx, representativeState, transition, execution, args...)
 	case *dynamicTriggerBehaviour:
+		if execution != nil {
+			execution.Kind = KindDynamic
+		}
 		var destination any
 		destination, err = t.Destination(ctx, args...)
 		if err == nil {
+			if execution != nil {
+				execution.SelectedDestination = KnownState{Value: destination, Known: true}
+			}
 			transition := Transition{Source: source, Destination: destination, Trigger: trigger}
-			err = sm.handleTransitioningTrigger(ctx, representativeState, transition, args...)
+			err = sm.handleTransitioningTrigger(ctx, representativeState, transition, execution, args...)
 		}
 	case *transitioningTriggerBehaviour:
+		if execution != nil {
+			execution.Kind = KindTransition
+			execution.SelectedDestination = KnownState{Value: t.Destination, Known: true}
+		}
 		if source == t.Destination {
+			if execution != nil {
+				execution.Kind = KindSuppressed
+			}
 			// If a trigger was found on a superstate that would cause unintended reentry, don't trigger.
 			break
 		}
 		transition := Transition{Source: source, Destination: t.Destination, Trigger: trigger}
-		err = sm.handleTransitioningTrigger(ctx, representativeState, transition, args...)
+		err = sm.handleTransitioningTrigger(ctx, representativeState, transition, execution, args...)
 	case *internalTriggerBehaviour:
+		if execution != nil {
+			execution.Kind = KindInternal
+		}
 		var sr *stateRepresentation
 		sr, err = sm.currentState(ctx)
 		if err == nil {
@@ -393,7 +424,7 @@ func (sm *StateMachine) internalFireOne(ctx context.Context, trigger Trigger, ar
 	return err
 }
 
-func (sm *StateMachine) handleReentryTrigger(ctx context.Context, sr *stateRepresentation, transition Transition, args ...any) error {
+func (sm *StateMachine) handleReentryTrigger(ctx context.Context, sr *stateRepresentation, transition Transition, execution *Execution, args ...any) error {
 	if err := sr.Exit(ctx, transition, args...); err != nil {
 		return err
 	}
@@ -413,10 +444,14 @@ func (sm *StateMachine) handleReentryTrigger(ctx context.Context, sr *stateRepre
 		return err
 	}
 	callEvents(sm.onTransitionedEvents, ctx, transition)
+	if execution != nil {
+		completed := transition
+		execution.CompletedTransition = &completed
+	}
 	return nil
 }
 
-func (sm *StateMachine) handleTransitioningTrigger(ctx context.Context, sr *stateRepresentation, transition Transition, args ...any) error {
+func (sm *StateMachine) handleTransitioningTrigger(ctx context.Context, sr *stateRepresentation, transition Transition, execution *Execution, args ...any) error {
 	if err := sr.Exit(ctx, transition, args...); err != nil {
 		return err
 	}
@@ -436,6 +471,9 @@ func (sm *StateMachine) handleTransitioningTrigger(ctx context.Context, sr *stat
 		}
 	}
 	callEvents(sm.onTransitionedEvents, ctx, Transition{transition.Source, rep.State, transition.Trigger, false})
+	if execution != nil {
+		execution.CompletedTransition = &Transition{transition.Source, rep.State, transition.Trigger, false}
+	}
 	return nil
 }
 
